@@ -34,6 +34,7 @@ import qualified Language.Haskell.Liquid.GHC.Logging     as LH   (addTcRnUnknown
 
 import           Language.Haskell.Liquid.GHC.Plugin.Types
 import qualified Language.Haskell.Liquid.GHC.Plugin.Serialisation as Serialisation
+import qualified Language.Haskell.Liquid.GHC.Plugin.Compact as Compact
 import           Language.Haskell.Liquid.GHC.Plugin.SpecFinder
                                                          as SpecFinder
 
@@ -224,7 +225,7 @@ swapBreadcrumb mod0 new = liftIO $ atomicModifyIORef' breadcrumbsRef $ \breadcru
 
 lhDynFlags :: [CommandLineOption] -> HscEnv -> IO HscEnv
 lhDynFlags _ hscEnv =
-    return hscEnv
+    return $ Compact.installInterfaceHook $ hscEnv
       { hsc_dflags =
           hsc_dflags hscEnv
            -- Ignore-interface-pragmas need to be unset to have access to
@@ -372,14 +373,13 @@ serialiseSpec tcGblEnv liquidLib = do
   -- liftIO $ putStrLn "liquidHaskellCheck 9"
   -- ---
 
-  serialisedSpec <- liftIO $ Serialisation.serialiseLiquidLib liquidLib thisModule
+  env <- getTopEnv
+  serialisedSpec <- liftIO $ Serialisation.serialiseLiquidLib env liquidLib tcGblEnv
   debugLog $ "Serialised annotation ==> " ++ (O.showSDocUnsafe . O.ppr $ serialisedSpec)
 
   -- liftIO $ putStrLn "liquidHaskellCheck 10"
 
   pure $ tcGblEnv { tcg_anns = serialisedSpec : tcg_anns tcGblEnv }
-  where
-    thisModule = tcg_mod tcGblEnv
 
 processInputSpec
   :: Config
@@ -496,29 +496,18 @@ isIgnore sp = any ((== "--skip-module") . F.val) (pragmas sp)
 --------------------------------------------------------------------------------
 
 -- | Loads the specs of direct dependencies and /their/ dependencies as well.
-loadDependencies :: Config -> [Module] -> TcM TargetDependencies
+loadDependencies :: Config -> [Module] -> TcM (TargetDependencies, [SpecReference])
 loadDependencies currentModuleConfig mods = do
   hscEnv    <- env_top <$> getEnv
-  results   <- SpecFinder.findRelevantSpecs
+  (deps, refs) <- SpecFinder.findRelevantSpecs
                  (excludeAutomaticAssumptionsFor currentModuleConfig) hscEnv mods
-  -- REVIEW: What does reversing the list accomplishes here?
-  let deps = TargetDependencies $ foldl' processResult mempty (reverse results)
   redundant <- liftIO $ configToRedundantDependencies hscEnv currentModuleConfig
 
   debugLog $ "Redundant dependencies ==> " ++ show redundant
 
-  pure $ foldl' (flip dropDependency) deps redundant
-  where
-    processResult
-      :: HM.HashMap StableModule LiftedSpec
-      -> SpecFinderResult
-      -> HM.HashMap StableModule LiftedSpec
-    processResult acc (SpecNotFound _mdl) = acc
-    processResult acc (LibFound originalModule lib) =
-      HM.insert
-        (toStableModule originalModule)
-        (libTarget lib)
-        (acc <> getDependencies (libDeps lib))
+  pure ( foldl' (flip dropDependency) deps redundant
+       , filter ((`notElem` redundant) . specModule) refs
+       )
 
 data LiquidHaskellContext = LiquidHaskellContext {
     lhGlobalCfg        :: Config
@@ -554,7 +543,7 @@ processModule LiquidHaskellContext{..} = do
   let bareSpec0       = lhInputSpec
 
   withPragmas lhGlobalCfg (Ms.pragmas bareSpec0) $ \moduleCfg -> do
-    dependencies <- loadDependencies moduleCfg lhRelevantModules
+    (dependencies, dependencyRefs) <- loadDependencies moduleCfg lhRelevantModules
 
     debugLog $ "Found " <> show (HM.size $ getDependencies dependencies) <> " dependencies:"
     when debugLogs $
@@ -626,7 +615,7 @@ processModule LiquidHaskellContext{..} = do
         debugLog $ "bareSpec ==> "   ++ show bareSpec
         debugLog $ "liftedSpec ==> " ++ show liftedSpec
 
-        let clientLib  = mkLiquidLib liftedSpec & addLibDependencies dependencies
+        let clientLib  = mkLiquidLib liftedSpec & addLibDependencies dependencyRefs
 
         let result' = ProcessModuleResult {
             pmrClientLib  = clientLib

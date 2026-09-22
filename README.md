@@ -86,6 +86,10 @@ when running `cabal` to skip rebuilding those packages.
 DANGER: Note that this can give an invalid result if the changes to
 `liquidhaskell-boot` do require rebuilding other `liquid*` packages.
 
+Changes to the specification interface format require rebuilding those
+packages. See [upgrading the interface format](docs/mkDocs/docs/install.md#upgrading-from-the-annotation-based-interface-format)
+for the compact format's migration instructions.
+
 ## How To Run Regression Tests
 
 For documentation on the `test-driver` executable itself, please refer to the
@@ -276,6 +280,21 @@ interface LH with the old executable. Generally speaking, the [GHC.Interface][] 
 and it's rarely what one wants to modify. It will probably be removed at some point.
 
 ## Plugin architecture
+
+The historical description below uses the annotation-based interface format.
+The current plugin stores specification bodies in the `liquidhaskell.spec.v1`
+extensible interface field, keeps a versioned fingerprint and size in a small
+module annotation, and stores dependency references instead of embedding their
+specification bodies. Dependency loading merges specifications incrementally
+and shares decoded libraries through a bounded session cache. Specification
+changes participate in recompilation checks, including with `-fno-code`.
+
+The storage and recompilation regression tests are registered as the
+`liquidhaskell-boot:plugin-storage` test suite:
+
+```sh
+cabal test liquidhaskell-boot:plugin-storage
+```
 
 Broadly speaking, the Plugin is organised this way: In the [typechecking phase][], we typecheck and desugar
 each module via the GHC API in order to extract the unoptimised [core binds][] that are needed by
