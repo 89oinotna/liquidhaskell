@@ -35,6 +35,7 @@ import           Language.Haskell.Liquid.GHC.Plugin.Types (LiquidLib, SpecRefere
 import qualified Language.Haskell.Liquid.GHC.Plugin.Compact as Compact
 import qualified Language.Haskell.Liquid.GHC.Plugin.Cache as Cache
 import           Language.Haskell.Liquid.Types.Names
+import           Language.Haskell.Liquid.UX.Config (Config, specCacheLimit)
 
 
 --
@@ -57,8 +58,8 @@ serialiseLiquidLib env lib tcg = do
       GHC.toSerialized Compact.markerBytes (Compact.payloadMarker fingerprint $ BS.length bytes)
 
 -- GHC's interface cache holds encoded data; this cache holds canonical decoded
--- module specs, never merged transitive closures. It is bounded by both entry
--- count and encoded size. The EPS weak key releases the entire cache when its
+-- module specs, never merged transitive closures. Entry and encoded-size limits
+-- are opt-in. The EPS weak key releases the entire cache when its
 -- compilation session dies, including sessions abandoned by IDE clients.
 type LibraryCache = Cache.Cache SpecReference LiquidLib
 data SessionCache = SessionCache !Unique !(Weak (IORef GHC.ExternalPackageState)) !LibraryCache
@@ -73,7 +74,7 @@ getLibraryCache env = modifyMVar sessionCaches $ \sessions -> do
     case found of
       Just cache -> pure (sessions, cache)
       Nothing -> do
-        cache <- Cache.newCache 128 (64 * 1024 * 1024)
+        cache <- Cache.newCache
         key <- newUnique
         weak <- mkWeakIORef epsRef $ modifyMVar_ sessionCaches $ \allSessions -> do
           let live = filter (\(SessionCache k _ _) -> k /= key) allSessions
@@ -88,8 +89,8 @@ getLibraryCache env = modifyMVar sessionCaches $ \sessions -> do
       alive <- deRefWeak weak
       if alive == Just epsRef then pure (Just cache) else findSession rest
 
-deserialiseLiquidLib :: GHC.HscEnv -> GHC.Module -> IO (Maybe (SpecReference, LiquidLib))
-deserialiseLiquidLib env thisModule = do
+deserialiseLiquidLib :: Config -> GHC.HscEnv -> GHC.Module -> IO (Maybe (SpecReference, LiquidLib))
+deserialiseLiquidLib cfg env thisModule = do
     eps <- readIORef $ GHC.euc_eps $ GHC.ue_eps $ GHC.hsc_unit_env env
     home <- GHC.lookupHugByModule thisModule (GHC.hsc_HUG env)
     let homeAnnotations = case home of
@@ -112,7 +113,7 @@ deserialiseLiquidLib env thisModule = do
         (fingerprint, size) <- either (ioError . userError) pure $ Compact.decodeMarker marker
         let reference = SpecReference (GHC.toStableModule thisModule) fingerprint
         cache <- getLibraryCache env
-        lib <- Cache.cached cache reference size $ do
+        lib <- Cache.cached cache limits reference size $ do
           iface <- GHC.lookupIfaceByModuleHsc env thisModule
           bytes <- maybe (pure Nothing) Compact.readPayload iface >>= maybe missingPayload pure
           actual <- Compact.payloadId bytes
@@ -124,6 +125,9 @@ deserialiseLiquidLib env thisModule = do
           nameCache `seq` decodeLiquidLib nameCache (B.fromStrict bytes)
         pure $ Just (reference, lib)
   where
+    limits
+      | specCacheLimit cfg = Cache.Bounded 128 (64 * 1024 * 1024)
+      | otherwise = Cache.Unbounded
     missingPayload = ioError $ userError $ "LiquidHaskell: missing compact specification for " ++
       GHC.renderModule thisModule ++ ". Rebuild this dependency with the current LiquidHaskell plugin."
 

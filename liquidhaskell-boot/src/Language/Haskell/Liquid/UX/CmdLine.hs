@@ -142,6 +142,7 @@ defConfig = Config
   , noSimplifyCore                = False
   , noslice                       = False
   , noLiftedImport                = False
+  , specCacheLimit                = False
   , proofLogicEval                = False
   , pleWithUndecidedGuards        = False
   , interpreter                   = False
@@ -287,6 +288,10 @@ lhOptions =
       "Disable non-concrete KVar slicing"
   , opt [] ["no-lifted-imports"] (NoArg $ fm $ \c -> c { noLiftedImport = True })
       "Disable loading lifted specifications (for legacy libs)"
+  , opt [] ["spec-cache-limit"] (NoArg $ fm $ \c -> c { specCacheLimit = True })
+      "Limit the decoded specification cache to 128 entries and 64 MiB of encoded data"
+  , opt [] ["no-spec-cache-limit"] (NoArg $ fm $ \c -> c { specCacheLimit = False })
+      "Cache decoded specifications without entry or size limits (default)"
   , opt [] ["json"] (NoArg $ fm $ \c -> c { json = True })
       "Print results in JSON (for editor integration)"
   , opt [] ["counter-examples"] (NoArg $ fm $ \c -> c { counterExamples = True })

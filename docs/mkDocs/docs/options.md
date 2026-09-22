@@ -305,6 +305,51 @@ instantiation of polymorphic type variables.
 It is suggested to use on theorem proving style when reflected
 functions are trivially refined.
 
+## Specification cache
+
+**Options:** `--spec-cache-limit`, `--no-spec-cache-limit`
+
+The plugin shares decoded dependency specifications within a compilation
+session. Caching is enabled with no entry or size limits by default.
+
+Use `--spec-cache-limit` to opt into a maximum of 128 entries whose combined
+encoded size is at most 64 MiB:
+
+```sh
+LIQUIDHASKELL_OPTS="--spec-cache-limit" cabal build
+```
+
+Alternatively, add it to your package's plugin options:
+
+```cabal
+ghc-options: -fplugin=LiquidHaskell -fplugin-opt=LiquidHaskell:--spec-cache-limit
+```
+
+Use `--no-spec-cache-limit` to explicitly select unlimited caching, including
+to override limits inherited through `LIQUIDHASKELL_OPTS` or plugin options:
+
+```haskell
+{-@ LIQUID "--no-spec-cache-limit" @-}
+```
+
+Both options are also accepted in a module's `LIQUID` pragma. Plugin options
+override environment settings, and module pragmas override plugin options.
+When both flags occur at the same level, the last one wins. Each dependency
+lookup uses the importing module's configuration; a module opting into limits
+enforces them on its next cache lookup, including on a cache hit. Use environment
+or package options to select one policy across modules.
+
+These optional limits control retention for reuse; they do not limit project
+size or the dependencies available for verification. Evicted specifications
+are decoded again when needed. Removing the opt-in restores unlimited caching
+unless an outer configuration still enables limits. Both modes keep caching
+enabled.
+
+Disabling the limits can avoid repeated decoding, but retains more decoded
+specifications until the session ends or a subsequent lookup enforces limits.
+Neither mode caps process memory: the encoded size is not the decoded heap
+size, and GHC and verification also use memory.
+
 ## Incremental Checking
 
 **Options:** `diff`

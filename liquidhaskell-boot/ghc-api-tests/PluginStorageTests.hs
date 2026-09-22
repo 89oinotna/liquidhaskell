@@ -1,4 +1,5 @@
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE PackageImports #-}
 
 module Main (main) where
 
@@ -10,6 +11,7 @@ import qualified Data.ByteString as BS
 import Data.IORef
 import Data.Maybe (isNothing)
 import System.Directory
+import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.FilePath
 import System.IO
 import System.Mem (performGC)
@@ -20,10 +22,14 @@ import qualified GHC.Paths as Paths
 
 import qualified Language.Haskell.Liquid.GHC.Plugin.Cache as Cache
 import qualified Language.Haskell.Liquid.GHC.Plugin.Compact as Compact
+import qualified "liquidhaskell-boot" Language.Haskell.Liquid.UX.CmdLine as CmdLine
+import "liquidhaskell-boot" Language.Haskell.Liquid.UX.Config (specCacheLimit)
 
 main :: IO ()
 main = do
   testCache
+  testUnboundedCache
+  testCacheOption
   testMarker
   forM_ ["-fno-code", "-fobject-code", "-fbyte-code"] $ \mode ->
     testInterfaces Paths.libdir mode
@@ -34,9 +40,10 @@ check label success = unless success $ fail label
 
 testCache :: IO ()
 testCache = do
-  cache <- Cache.newCache 2 100
+  cache <- Cache.newCache
   calls <- newIORef (0 :: Int)
-  let fetch key weight = Cache.cached cache key weight $ atomicModifyIORef' calls $ \n -> (n + 1, n + 1)
+  let fetch key weight = Cache.cached cache (Cache.Bounded 2 100) key weight $
+        atomicModifyIORef' calls $ \n -> (n + 1, n + 1)
   a <- fetch ("A", 1 :: Int) 4
   a' <- fetch ("A", 1) 4
   check "cache hit must reuse decoded value" (a == a')
@@ -51,19 +58,19 @@ testCache = do
   big <- fetch ("large", 1) 101
   big' <- fetch ("large", 1) 101
   check "oversized entries must not remain cached" (big /= big')
-  weighted <- Cache.newCache 10 5
-  _ <- Cache.cached weighted (1 :: Int) 3 (pure (1 :: Int))
-  _ <- Cache.cached weighted 2 3 (pure 2)
-  evicted <- Cache.cached weighted 1 3 (pure 3)
+  weighted <- Cache.newCache
+  _ <- Cache.cached weighted (Cache.Bounded 10 5) (1 :: Int) 3 (pure (1 :: Int))
+  _ <- Cache.cached weighted (Cache.Bounded 10 5) 2 3 (pure 2)
+  evicted <- Cache.cached weighted (Cache.Bounded 10 5) 1 3 (pure 3)
   check "encoded-size limit must evict entries" (evicted == 3)
 
-  shared <- Cache.newCache 10 100
+  shared <- Cache.newCache
   started <- newEmptyMVar
   finish <- newEmptyMVar
   results <- replicateM 8 newEmptyMVar
   count <- newIORef (0 :: Int)
   forM_ results $ \result -> void $ forkIO $ do
-    value <- try $ Cache.cached shared () 1 $ do
+    value <- try $ Cache.cached shared (Cache.Bounded 10 100) () 1 $ do
       modifyIORef' count (+ 1)
       putMVar started ()
       readMVar finish
@@ -74,29 +81,73 @@ testCache = do
   values <- mapM takeMVar results
   check "concurrent requests must all complete" (all (either (const False) (== 42)) values)
   readIORef count >>= check "concurrent misses must decode once" . (== 1)
-  failed <- try $ Cache.cached shared () 1 (pure 0)
+  failed <- try $ Cache.cached shared (Cache.Bounded 10 100) () 1 (pure 0)
   check "a cached value remains usable" (either (const False) (== 42) (failed :: Either SomeException Int))
-  retry <- Cache.newCache 1 10
-  (_ :: Either SomeException Int) <- try $ Cache.cached retry () 1 (throwIO $ userError "decode failed")
-  Cache.cached retry () 1 (pure (7 :: Int)) >>= check "failed decoding must not poison the cache" . (== 7)
+  retry <- Cache.newCache
+  (_ :: Either SomeException Int) <- try $ Cache.cached retry (Cache.Bounded 1 10) () 1 (throwIO $ userError "decode failed")
+  Cache.cached retry (Cache.Bounded 1 10) () 1 (pure (7 :: Int)) >>= check "failed decoding must not poison the cache" . (== 7)
 
   checkReleased "oversized values must be collectible without another lookup" 11 False
   checkReleased "evicted values must be collectible without another lookup" 1 True
   where
     checkReleased label weight evict = do
-      cache <- Cache.newCache 1 10
+      cache <- Cache.newCache
       weak <- do
         value <- newIORef ()
         weak <- mkWeakIORef value (pure ())
-        void $ Cache.cached cache (0 :: Int) weight (pure value)
+        void $ Cache.cached cache (Cache.Bounded 1 10) (0 :: Int) weight (pure value)
         pure weak
-      when evict $ void $ Cache.cached cache 1 1 (newIORef ())
+      when evict $ void $ Cache.cached cache (Cache.Bounded 1 10) 1 1 (newIORef ())
       performGC
       released <- isNothing <$> deRefWeak weak
       -- Keep the cache alive across GC, without touching it until after the
       -- weak-pointer check. Deferred eviction would keep the old value alive.
-      void $ Cache.cached cache 2 1 (newIORef ())
+      void $ Cache.cached cache (Cache.Bounded 1 10) 2 1 (newIORef ())
       check label released
+
+testUnboundedCache :: IO ()
+testUnboundedCache = do
+  cache <- Cache.newCache
+  let keys = [1 .. 256 :: Int]
+      weight = 64 * 1024 * 1024 + 1
+  forM_ keys $ \key -> void $ Cache.cached cache Cache.Unbounded key weight (pure key)
+  forM_ keys $ \key -> do
+    value <- Cache.cached cache Cache.Unbounded key weight (fail "unbounded cache evicted an entry")
+    check "unbounded mode reuses entries beyond both optional limits" (value == key)
+  -- A hit must also enforce a new policy; otherwise a module enabling limits
+  -- could keep the preceding module's unbounded cache alive indefinitely.
+  value <- Cache.cached cache (Cache.Bounded 128 (64 * 1024 * 1024)) 256 weight
+    (fail "switching policies should reuse a cached value before dropping it")
+  check "oversized hit remains usable when limits are restored" (value == 256)
+  forM_ keys $ \key -> do
+    reloaded <- Cache.cached cache Cache.Unbounded key weight (pure (-key))
+    check "restoring size limits evicts oversized entries" (reloaded == -key)
+
+  counted <- Cache.newCache
+  forM_ [1 .. 4 :: Int] $ \key -> void $ Cache.cached counted Cache.Unbounded key 1 (pure key)
+  _ <- Cache.cached counted (Cache.Bounded 2 100) 1 1 (fail "expected a cache hit")
+  Cache.cached counted Cache.Unbounded 4 1 (pure 0) >>=
+    check "restoring count limit preserves the other newest entry" . (== 4)
+  Cache.cached counted Cache.Unbounded 2 1 (pure 0) >>=
+    check "restoring count limit evicts the oldest entry" . (== 0)
+
+testCacheOption :: IO ()
+testCacheOption = bracket (lookupEnv "LIQUIDHASKELL_OPTS") restore $ \_ -> do
+  unsetEnv "LIQUIDHASKELL_OPTS"
+  let options = CmdLine.getOpts . ("--smtsolver=z3mem" :)
+  check "cache limits are disabled by default" (not $ specCacheLimit CmdLine.defConfig)
+  options [] >>= check "parsing without cache flags keeps limits disabled" . not . specCacheLimit
+  options ["--spec-cache-limit"] >>= check "the option enables cache limits" . specCacheLimit
+  options ["--spec-cache-limit", "--no-spec-cache-limit"] >>=
+    check "explicit opt-out overrides opt-in" . not . specCacheLimit
+  options ["--no-spec-cache-limit", "--spec-cache-limit"] >>=
+    check "the last cache option wins" . specCacheLimit
+  setEnv "LIQUIDHASKELL_OPTS" "--spec-cache-limit"
+  options [] >>= check "environment can enable cache limits" . specCacheLimit
+  options ["--no-spec-cache-limit"] >>=
+    check "plugin options override environment cache limits" . not . specCacheLimit
+  where
+    restore = maybe (unsetEnv "LIQUIDHASKELL_OPTS") (setEnv "LIQUIDHASKELL_OPTS")
 
 testMarker :: IO ()
 testMarker = do

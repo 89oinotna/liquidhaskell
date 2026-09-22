@@ -69,10 +69,21 @@ specification, rebuild the named dependency and the modules that import it.
 Do not use `LIQUID_DEV_MODE=true` for this migration: it skips rebuilding the
 assumption libraries.
 
-The plugin caches decoded specifications within a compilation session, retaining
-at most 128 entries with a combined encoded size of 64 MiB. This is a cache
-budget, not a limit on process memory: decoded specifications, GHC's data
-structures, and verification also consume memory.
+The plugin caches decoded specifications within a compilation session with
+no entry or size limits by default. To opt into limits of 128 entries and
+64 MiB of combined encoded size, use
+[`--spec-cache-limit`](options.md#specification-cache):
+
+```sh
+LIQUIDHASKELL_OPTS="--spec-cache-limit" cabal build
+```
+
+`--no-spec-cache-limit` explicitly selects the default unlimited behavior and
+can override an inherited opt-in. Both modes keep caching enabled. Optional
+limits control reuse, not project size or which dependencies can be checked.
+Unlimited caching can reduce repeated decoding at the cost of retaining more
+memory. The optional cache budget is not a limit on process memory: decoded
+specifications, GHC's data structures, and verification also consume memory.
 
 ## Examples
 

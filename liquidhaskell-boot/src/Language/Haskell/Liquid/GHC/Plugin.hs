@@ -499,8 +499,7 @@ isIgnore sp = any ((== "--skip-module") . F.val) (pragmas sp)
 loadDependencies :: Config -> [Module] -> TcM (TargetDependencies, [SpecReference])
 loadDependencies currentModuleConfig mods = do
   hscEnv    <- env_top <$> getEnv
-  (deps, refs) <- SpecFinder.findRelevantSpecs
-                 (excludeAutomaticAssumptionsFor currentModuleConfig) hscEnv mods
+  (deps, refs) <- SpecFinder.findRelevantSpecs currentModuleConfig hscEnv mods
   redundant <- liftIO $ configToRedundantDependencies hscEnv currentModuleConfig
 
   debugLog $ "Redundant dependencies ==> " ++ show redundant

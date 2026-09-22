@@ -51,12 +51,12 @@ data LoadedSpec = LoadedSpec !Bool !SpecReference !LiftedSpec
 --
 -- Assumptions are taken from _LHAssumptions modules only if the interface
 -- file of the matching module contains no spec.
-findRelevantSpecs :: [String] -- ^ Package to exclude for loading LHAssumptions
+findRelevantSpecs :: Config -- ^ Assumption exclusions and cache policy for this module
                   -> HscEnv
                   -> [Module]
                   -- ^ Any relevant module fetched during dependency-discovery.
                   -> TcM (TargetDependencies, [SpecReference])
-findRelevantSpecs lhAssmPkgExcludes hscEnv mods = do
+findRelevantSpecs cfg hscEnv mods = do
     entries <- foldM loadAndMerge HM.empty mods
     pure ( TargetDependencies $ HM.map (\(LoadedSpec _ _ spec) -> spec) entries
          , sortOn specModule [ref | LoadedSpec _ ref _ <- HM.elems entries]
@@ -91,7 +91,7 @@ findRelevantSpecs lhAssmPkgExcludes hscEnv mods = do
         -- References include package/unit identity and the exact saved spec
         -- fingerprint. Never resolve them by an unqualified module name.
         _ <- initIfaceTcRn $ loadInterface "liquidhaskell dependency" mdl ImportBySystem
-        found <- liftIO $ Serialisation.deserialiseLiquidLib hscEnv mdl
+        found <- liftIO $ Serialisation.deserialiseLiquidLib cfg hscEnv mdl
         case found of
           Just (actual, lib) -> do
             checkReference ref actual
@@ -107,7 +107,7 @@ findRelevantSpecs lhAssmPkgExcludes hscEnv mods = do
 
     loadRelevantSpec :: Module -> TcM (Maybe (SpecReference, LiquidLib))
     loadRelevantSpec currentModule = do
-      res <- liftIO $ Serialisation.deserialiseLiquidLib hscEnv currentModule
+      res <- liftIO $ Serialisation.deserialiseLiquidLib cfg hscEnv currentModule
       case res of
         Nothing -> loadModuleLHAssumptionsIfAny currentModule
         Just _ -> pure res
@@ -129,7 +129,7 @@ findRelevantSpecs lhAssmPkgExcludes hscEnv mods = do
       case res of
         Found _ assumptionsMod -> do
           _ <- initIfaceTcRn $ loadInterface "liquidhaskell assumptions" assumptionsMod ImportBySystem
-          liftIO $ Serialisation.deserialiseLiquidLib hscEnv assumptionsMod
+          liftIO $ Serialisation.deserialiseLiquidLib cfg hscEnv assumptionsMod
         FoundMultiple{} -> failWithTc $ mkTcRnUnknownMessage $ mkPlainError [] $
                              missingInterfaceErrorDiagnostic (initIfaceMessageOpts $ hsc_dflags hscEnv) $
                              cannotFindModule hscEnv assumptionsModName res
@@ -137,7 +137,7 @@ findRelevantSpecs lhAssmPkgExcludes hscEnv mods = do
 
     isImportExcluded m =
       let s = takeWhile Data.Char.isAlphaNum $ unitString (moduleUnit m)
-       in elem s lhAssmPkgExcludes
+       in elem s (excludeAutomaticAssumptionsFor cfg)
 
     assumptionsModuleName m =
       mkModuleNameFS $ moduleNameFS (moduleName m) <> "_LHAssumptions"
