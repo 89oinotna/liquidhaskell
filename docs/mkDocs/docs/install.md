@@ -70,17 +70,18 @@ Do not use `LIQUID_DEV_MODE=true` for this migration: it skips rebuilding the
 assumption libraries.
 
 The plugin caches decoded specifications within a compilation session with
-no entry or size limits by default. To opt into limits of 128 entries and
-64 MiB of combined encoded size, use
-[`--spec-cache-limit`](options.md#specification-cache):
+no entry or size limits by default. You can configure independent
+[entry-count and encoded-byte limits](options.md#specification-cache).
+For example, to retain at most 512 entries and 256 MiB of combined encoded size:
 
 ```sh
-LIQUIDHASKELL_OPTS="--spec-cache-limit" cabal build
+LIQUIDHASKELL_OPTS="--spec-cache-max-entries=512 --spec-cache-max-bytes=268435456" cabal build
 ```
 
-`--no-spec-cache-limit` explicitly selects the default unlimited behavior and
-can override an inherited opt-in. Both modes keep caching enabled. Optional
-limits control reuse, not project size or which dependencies can be checked.
+An omitted limit remains unlimited unless inherited from another configuration
+source. `--no-spec-cache-limit` clears both limits, and zero for either numeric
+limit disables retention without preventing specifications from loading.
+These settings control reuse, not project size or which dependencies can be checked.
 Unlimited caching can reduce repeated decoding at the cost of retaining more
 memory. The optional cache budget is not a limit on process memory: decoded
 specifications, GHC's data structures, and verification also consume memory.

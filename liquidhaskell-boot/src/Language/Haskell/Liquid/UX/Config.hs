@@ -77,7 +77,8 @@ data Config = Config
   -- PLE-OPT , autoInst      ntiate :: Instantiate -- ^ How to instantiate axioms
   , noslice                  :: Bool       -- ^ Disable non-concrete KVar slicing
   , noLiftedImport           :: Bool       -- ^ Disable loading lifted specifications (for "legacy" libs)
-  , specCacheLimit           :: Bool       -- ^ Enable entry and encoded-size limits on the decoded specification cache
+  , specCacheMaxEntries      :: Maybe Int  -- ^ Maximum cached specifications; Nothing means unlimited
+  , specCacheMaxBytes        :: Maybe Int  -- ^ Maximum combined encoded payload size; Nothing means unlimited
   , proofLogicEval           :: Bool       -- ^ Enable proof-by-logical-evaluation
   , pleWithUndecidedGuards   :: Bool       -- ^ Unfold invocations with undecided guards in PLE
   , interpreter              :: Bool       -- ^ Use an interpreter to assist PLE

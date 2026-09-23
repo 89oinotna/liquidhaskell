@@ -35,7 +35,7 @@ import           Language.Haskell.Liquid.GHC.Plugin.Types (LiquidLib, SpecRefere
 import qualified Language.Haskell.Liquid.GHC.Plugin.Compact as Compact
 import qualified Language.Haskell.Liquid.GHC.Plugin.Cache as Cache
 import           Language.Haskell.Liquid.Types.Names
-import           Language.Haskell.Liquid.UX.Config (Config, specCacheLimit)
+import           Language.Haskell.Liquid.UX.Config (Config, specCacheMaxEntries, specCacheMaxBytes)
 
 
 --
@@ -125,9 +125,7 @@ deserialiseLiquidLib cfg env thisModule = do
           nameCache `seq` decodeLiquidLib nameCache (B.fromStrict bytes)
         pure $ Just (reference, lib)
   where
-    limits
-      | specCacheLimit cfg = Cache.Bounded 128 (64 * 1024 * 1024)
-      | otherwise = Cache.Unbounded
+    limits = Cache.Limits (specCacheMaxEntries cfg) (specCacheMaxBytes cfg)
     missingPayload = ioError $ userError $ "LiquidHaskell: missing compact specification for " ++
       GHC.renderModule thisModule ++ ". Rebuild this dependency with the current LiquidHaskell plugin."
 

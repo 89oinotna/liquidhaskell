@@ -9,6 +9,7 @@ import Control.Monad
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString as BS
 import Data.IORef
+import Data.List (isInfixOf)
 import Data.Maybe (isNothing)
 import System.Directory
 import System.Environment (lookupEnv, setEnv, unsetEnv)
@@ -23,12 +24,13 @@ import qualified GHC.Paths as Paths
 import qualified Language.Haskell.Liquid.GHC.Plugin.Cache as Cache
 import qualified Language.Haskell.Liquid.GHC.Plugin.Compact as Compact
 import qualified "liquidhaskell-boot" Language.Haskell.Liquid.UX.CmdLine as CmdLine
-import "liquidhaskell-boot" Language.Haskell.Liquid.UX.Config (specCacheLimit)
+import "liquidhaskell-boot" Language.Haskell.Liquid.UX.Config (Config, specCacheMaxEntries, specCacheMaxBytes)
 
 main :: IO ()
 main = do
   testCache
   testUnboundedCache
+  testIndependentCacheLimits
   testCacheOption
   testMarker
   forM_ ["-fno-code", "-fobject-code", "-fbyte-code"] $ \mode ->
@@ -42,7 +44,7 @@ testCache :: IO ()
 testCache = do
   cache <- Cache.newCache
   calls <- newIORef (0 :: Int)
-  let fetch key weight = Cache.cached cache (Cache.Bounded 2 100) key weight $
+  let fetch key weight = Cache.cached cache (Cache.Limits (Just 2) (Just 100)) key weight $
         atomicModifyIORef' calls $ \n -> (n + 1, n + 1)
   a <- fetch ("A", 1 :: Int) 4
   a' <- fetch ("A", 1) 4
@@ -59,9 +61,9 @@ testCache = do
   big' <- fetch ("large", 1) 101
   check "oversized entries must not remain cached" (big /= big')
   weighted <- Cache.newCache
-  _ <- Cache.cached weighted (Cache.Bounded 10 5) (1 :: Int) 3 (pure (1 :: Int))
-  _ <- Cache.cached weighted (Cache.Bounded 10 5) 2 3 (pure 2)
-  evicted <- Cache.cached weighted (Cache.Bounded 10 5) 1 3 (pure 3)
+  _ <- Cache.cached weighted (Cache.Limits (Just 10) (Just 5)) (1 :: Int) 3 (pure (1 :: Int))
+  _ <- Cache.cached weighted (Cache.Limits (Just 10) (Just 5)) 2 3 (pure 2)
+  evicted <- Cache.cached weighted (Cache.Limits (Just 10) (Just 5)) 1 3 (pure 3)
   check "encoded-size limit must evict entries" (evicted == 3)
 
   shared <- Cache.newCache
@@ -70,7 +72,7 @@ testCache = do
   results <- replicateM 8 newEmptyMVar
   count <- newIORef (0 :: Int)
   forM_ results $ \result -> void $ forkIO $ do
-    value <- try $ Cache.cached shared (Cache.Bounded 10 100) () 1 $ do
+    value <- try $ Cache.cached shared (Cache.Limits (Just 10) (Just 100)) () 1 $ do
       modifyIORef' count (+ 1)
       putMVar started ()
       readMVar finish
@@ -81,11 +83,11 @@ testCache = do
   values <- mapM takeMVar results
   check "concurrent requests must all complete" (all (either (const False) (== 42)) values)
   readIORef count >>= check "concurrent misses must decode once" . (== 1)
-  failed <- try $ Cache.cached shared (Cache.Bounded 10 100) () 1 (pure 0)
+  failed <- try $ Cache.cached shared (Cache.Limits (Just 10) (Just 100)) () 1 (pure 0)
   check "a cached value remains usable" (either (const False) (== 42) (failed :: Either SomeException Int))
   retry <- Cache.newCache
-  (_ :: Either SomeException Int) <- try $ Cache.cached retry (Cache.Bounded 1 10) () 1 (throwIO $ userError "decode failed")
-  Cache.cached retry (Cache.Bounded 1 10) () 1 (pure (7 :: Int)) >>= check "failed decoding must not poison the cache" . (== 7)
+  (_ :: Either SomeException Int) <- try $ Cache.cached retry (Cache.Limits (Just 1) (Just 10)) () 1 (throwIO $ userError "decode failed")
+  Cache.cached retry (Cache.Limits (Just 1) (Just 10)) () 1 (pure (7 :: Int)) >>= check "failed decoding must not poison the cache" . (== 7)
 
   checkReleased "oversized values must be collectible without another lookup" 11 False
   checkReleased "evicted values must be collectible without another lookup" 1 True
@@ -95,14 +97,14 @@ testCache = do
       weak <- do
         value <- newIORef ()
         weak <- mkWeakIORef value (pure ())
-        void $ Cache.cached cache (Cache.Bounded 1 10) (0 :: Int) weight (pure value)
+        void $ Cache.cached cache (Cache.Limits (Just 1) (Just 10)) (0 :: Int) weight (pure value)
         pure weak
-      when evict $ void $ Cache.cached cache (Cache.Bounded 1 10) 1 1 (newIORef ())
+      when evict $ void $ Cache.cached cache (Cache.Limits (Just 1) (Just 10)) 1 1 (newIORef ())
       performGC
       released <- isNothing <$> deRefWeak weak
       -- Keep the cache alive across GC, without touching it until after the
       -- weak-pointer check. Deferred eviction would keep the old value alive.
-      void $ Cache.cached cache (Cache.Bounded 1 10) 2 1 (newIORef ())
+      void $ Cache.cached cache (Cache.Limits (Just 1) (Just 10)) 2 1 (newIORef ())
       check label released
 
 testUnboundedCache :: IO ()
@@ -110,42 +112,113 @@ testUnboundedCache = do
   cache <- Cache.newCache
   let keys = [1 .. 256 :: Int]
       weight = 64 * 1024 * 1024 + 1
-  forM_ keys $ \key -> void $ Cache.cached cache Cache.Unbounded key weight (pure key)
+  forM_ keys $ \key -> void $ Cache.cached cache (Cache.Limits Nothing Nothing) key weight (pure key)
   forM_ keys $ \key -> do
-    value <- Cache.cached cache Cache.Unbounded key weight (fail "unbounded cache evicted an entry")
+    value <- Cache.cached cache (Cache.Limits Nothing Nothing) key weight (fail "unbounded cache evicted an entry")
     check "unbounded mode reuses entries beyond both optional limits" (value == key)
   -- A hit must also enforce a new policy; otherwise a module enabling limits
   -- could keep the preceding module's unbounded cache alive indefinitely.
-  value <- Cache.cached cache (Cache.Bounded 128 (64 * 1024 * 1024)) 256 weight
+  value <- Cache.cached cache (Cache.Limits (Just 128) (Just (64 * 1024 * 1024))) 256 weight
     (fail "switching policies should reuse a cached value before dropping it")
   check "oversized hit remains usable when limits are restored" (value == 256)
   forM_ keys $ \key -> do
-    reloaded <- Cache.cached cache Cache.Unbounded key weight (pure (-key))
+    reloaded <- Cache.cached cache (Cache.Limits Nothing Nothing) key weight (pure (-key))
     check "restoring size limits evicts oversized entries" (reloaded == -key)
 
   counted <- Cache.newCache
-  forM_ [1 .. 4 :: Int] $ \key -> void $ Cache.cached counted Cache.Unbounded key 1 (pure key)
-  _ <- Cache.cached counted (Cache.Bounded 2 100) 1 1 (fail "expected a cache hit")
-  Cache.cached counted Cache.Unbounded 4 1 (pure 0) >>=
+  forM_ [1 .. 4 :: Int] $ \key -> void $ Cache.cached counted (Cache.Limits Nothing Nothing) key 1 (pure key)
+  _ <- Cache.cached counted (Cache.Limits (Just 2) (Just 100)) 1 1 (fail "expected a cache hit")
+  Cache.cached counted (Cache.Limits Nothing Nothing) 4 1 (pure 0) >>=
     check "restoring count limit preserves the other newest entry" . (== 4)
-  Cache.cached counted Cache.Unbounded 2 1 (pure 0) >>=
+  Cache.cached counted (Cache.Limits Nothing Nothing) 2 1 (pure 0) >>=
     check "restoring count limit evicts the oldest entry" . (== 0)
+
+testIndependentCacheLimits :: IO ()
+testIndependentCacheLimits = do
+  -- An entry-only limit must not impose the old, implicit byte budget.
+  counted <- Cache.newCache
+  let countLimit = Cache.Limits (Just 2) Nothing
+      largeWeight = maxBound :: Int
+  forM_ [1 .. 3 :: Int] $ \key -> void $
+    Cache.cached counted countLimit key largeWeight (pure key)
+  Cache.cached counted countLimit 2 largeWeight (fail "unexpected byte limit") >>=
+    check "entry-only limit retains oversized weights" . (== 2)
+  Cache.cached counted countLimit 1 largeWeight (pure 4) >>=
+    check "entry-only limit still evicts the oldest entry" . (== 4)
+
+  -- A byte-only limit must not impose the old, implicit 128-entry cap.
+  weighted <- Cache.newCache
+  let byteLimit = Cache.Limits Nothing (Just 256)
+      keys = [1 .. 256 :: Int]
+  forM_ keys $ \key -> void $ Cache.cached weighted byteLimit key 1 (pure key)
+  forM_ keys $ \key -> Cache.cached weighted byteLimit key 1
+    (fail "byte-only cache evicted an entry within budget") >>=
+      check "byte-only limit permits 256 entries at the exact budget" . (== key)
+  _ <- Cache.cached weighted byteLimit 257 1 (pure 257)
+  Cache.cached weighted byteLimit 1 1 (pure 0) >>=
+    check "byte-only limit evicts when the total exceeds the budget" . (== 0)
+
+  -- Zero disables retention, even for a zero-weight entry or an existing hit.
+  forM_ [Cache.Limits (Just 0) Nothing, Cache.Limits Nothing (Just 0)] $ \limits -> do
+    cache <- Cache.newCache
+    _ <- Cache.cached cache (Cache.Limits Nothing Nothing) (1 :: Int) 0 (pure (1 :: Int))
+    _ <- Cache.cached cache (Cache.Limits Nothing Nothing) 2 0 (pure 2)
+    Cache.cached cache limits 1 0 (fail "zero limit must return the existing hit") >>=
+      check "zero limit returns a usable cached value" . (== 1)
+    Cache.cached cache (Cache.Limits Nothing Nothing) 2 0 (pure 3) >>=
+      check "zero limit clears other retained entries" . (== 3)
+    forM_ [4, 5] $ \value -> Cache.cached cache limits 1 0 (pure value) >>=
+      check "zero limit loads without retaining the result" . (== value)
+
+  overflow <- Cache.newCache
+  let maxBytes = Cache.Limits Nothing (Just (maxBound :: Int))
+  _ <- Cache.cached overflow maxBytes (1 :: Int) largeWeight (pure (1 :: Int))
+  _ <- Cache.cached overflow maxBytes 2 largeWeight (pure 2)
+  Cache.cached overflow maxBytes 1 largeWeight (pure 3) >>=
+    check "encoded-byte totals must not overflow and bypass eviction" . (== 3)
 
 testCacheOption :: IO ()
 testCacheOption = bracket (lookupEnv "LIQUIDHASKELL_OPTS") restore $ \_ -> do
   unsetEnv "LIQUIDHASKELL_OPTS"
   let options = CmdLine.getOpts . ("--smtsolver=z3mem" :)
-  check "cache limits are disabled by default" (not $ specCacheLimit CmdLine.defConfig)
-  options [] >>= check "parsing without cache flags keeps limits disabled" . not . specCacheLimit
-  options ["--spec-cache-limit"] >>= check "the option enables cache limits" . specCacheLimit
-  options ["--spec-cache-limit", "--no-spec-cache-limit"] >>=
-    check "explicit opt-out overrides opt-in" . not . specCacheLimit
-  options ["--no-spec-cache-limit", "--spec-cache-limit"] >>=
-    check "the last cache option wins" . specCacheLimit
-  setEnv "LIQUIDHASKELL_OPTS" "--spec-cache-limit"
-  options [] >>= check "environment can enable cache limits" . specCacheLimit
+      limits c = (specCacheMaxEntries c, specCacheMaxBytes c)
+      expect label expected args = options args >>= check label . (== expected) . limits
+  check "cache limits are disabled by default" (limits CmdLine.defConfig == (Nothing, Nothing))
+  expect "parsing without cache flags keeps limits disabled" (Nothing, Nothing) []
+  expect "entry count can be configured independently" (Just 7, Nothing)
+    ["--spec-cache-max-entries=7"]
+  expect "encoded bytes can be configured independently" (Nothing, Just 12345)
+    ["--spec-cache-max-bytes=12345"]
+  expect "both limits can be configured" (Just 7, Just 12345)
+    ["--spec-cache-max-entries=7", "--spec-cache-max-bytes=12345"]
+  expect "explicit opt-out clears both limits" (Nothing, Nothing)
+    ["--spec-cache-max-entries=7", "--spec-cache-max-bytes=12345", "--no-spec-cache-limit"]
+  expect "a limit can be set after an explicit reset" (Nothing, Just 9)
+    ["--spec-cache-max-entries=7", "--no-spec-cache-limit", "--spec-cache-max-bytes=9"]
+  expect "the last value for each limit wins" (Just 3, Just 10)
+    ["--spec-cache-max-entries=7", "--spec-cache-max-bytes=10", "--spec-cache-max-entries=3"]
+  expect "zero limits are accepted" (Just 0, Just 0)
+    ["--spec-cache-max-entries=0", "--spec-cache-max-bytes=0"]
+  expect "the largest representable byte limit is accepted" (Nothing, Just maxBound)
+    ["--spec-cache-max-bytes=" ++ show (maxBound :: Int)]
+  setEnv "LIQUIDHASKELL_OPTS" "--spec-cache-max-entries=7 --spec-cache-max-bytes=12345"
+  expect "environment can configure both limits" (Just 7, Just 12345) []
+  expect "plugin options override one inherited limit without clearing the other" (Just 3, Just 12345)
+    ["--spec-cache-max-entries=3"]
   options ["--no-spec-cache-limit"] >>=
-    check "plugin options override environment cache limits" . not . specCacheLimit
+    check "plugin reset overrides both environment limits" . (== (Nothing, Nothing)) . limits
+  unsetEnv "LIQUIDHASKELL_OPTS"
+  forM_ ["spec-cache-max-entries", "spec-cache-max-bytes"] $ \flag ->
+    forM_ ["-1", "abc", "1.5", "", show (toInteger (maxBound :: Int) + 1)] $ \bad -> do
+      let arg = "--" ++ flag ++ "=" ++ bad
+      result <- try $ options [arg]
+      check ("invalid cache limit must be rejected: " ++ arg) $
+        either (isInfixOf ("for --" ++ flag) . displayException) (const False)
+          (result :: Either SomeException Config)
+      resetResult <- try $ options [arg, "--no-spec-cache-limit"]
+      check ("reset must not hide an invalid cache limit: " ++ arg) $
+        either (isInfixOf ("for --" ++ flag) . displayException) (const False)
+          (resetResult :: Either SomeException Config)
   where
     restore = maybe (unsetEnv "LIQUIDHASKELL_OPTS") (setEnv "LIQUIDHASKELL_OPTS")
 

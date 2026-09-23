@@ -307,22 +307,40 @@ functions are trivially refined.
 
 ## Specification cache
 
-**Options:** `--spec-cache-limit`, `--no-spec-cache-limit`
+**Options:** `--spec-cache-max-entries=N`, `--spec-cache-max-bytes=N`,
+`--no-spec-cache-limit`
 
 The plugin shares decoded dependency specifications within a compilation
 session. Caching is enabled with no entry or size limits by default.
 
-Use `--spec-cache-limit` to opt into a maximum of 128 entries whose combined
-encoded size is at most 64 MiB:
+The two limits are independent: setting one leaves the other unlimited unless
+it was set by an earlier option or inherited configuration. If both are set,
+both must be satisfied; the cache evicts least recently used entries as needed.
+
+| Option | Meaning |
+| --- | --- |
+| `--spec-cache-max-entries=N` | Retain at most `N` decoded specifications. |
+| `--spec-cache-max-bytes=N` | Retain specifications whose combined **encoded** payload size is at most `N` bytes. This is not decoded heap usage. |
+| `--no-spec-cache-limit` | Clear both limits and restore unlimited retention. |
+
+Values must be non-negative integers that fit in the platform's `Int` type.
+Negative, malformed, and out-of-range values are rejected. Either limit set to
+`0` disables cache retention: specifications still load and remain usable by
+verification, but subsequent requests may decode them again. Byte values are
+plain integers, without unit suffixes; 64 MiB is `67108864` bytes.
+
+For example, choose an entry limit of 512 and a byte budget of 256 MiB:
 
 ```sh
-LIQUIDHASKELL_OPTS="--spec-cache-limit" cabal build
+LIQUIDHASKELL_OPTS="--spec-cache-max-entries=512 --spec-cache-max-bytes=268435456" cabal build
 ```
 
-Alternatively, add it to your package's plugin options:
+Alternatively, add the limits to your package's plugin options:
 
 ```cabal
-ghc-options: -fplugin=LiquidHaskell -fplugin-opt=LiquidHaskell:--spec-cache-limit
+ghc-options: -fplugin=LiquidHaskell
+             -fplugin-opt=LiquidHaskell:--spec-cache-max-entries=512
+             -fplugin-opt=LiquidHaskell:--spec-cache-max-bytes=268435456
 ```
 
 Use `--no-spec-cache-limit` to explicitly select unlimited caching, including
@@ -332,23 +350,35 @@ to override limits inherited through `LIQUIDHASKELL_OPTS` or plugin options:
 {-@ LIQUID "--no-spec-cache-limit" @-}
 ```
 
-Both options are also accepted in a module's `LIQUID` pragma. Plugin options
+All three options are also accepted in a module's `LIQUID` pragma. Plugin options
 override environment settings, and module pragmas override plugin options.
-When both flags occur at the same level, the last one wins. Each dependency
-lookup uses the importing module's configuration; a module opting into limits
-enforces them on its next cache lookup, including on a cache hit. Use environment
-or package options to select one policy across modules.
+The last value for each limit wins; changing one limit preserves the other.
+`--no-spec-cache-limit` clears both at its position in the option sequence, and
+later numeric options can set limits again. For example, inheriting both limits
+and then applying `--no-spec-cache-limit --spec-cache-max-entries=100` selects
+an entry-only limit of 100. In source, put each option in its own pragma.
+
+Each dependency lookup uses the importing module's configuration. A stricter
+policy trims entries retained under earlier settings on the next lookup,
+including on a cache hit. Use environment or package options to select one
+policy across modules.
 
 These optional limits control retention for reuse; they do not limit project
 size or the dependencies available for verification. Evicted specifications
-are decoded again when needed. Removing the opt-in restores unlimited caching
-unless an outer configuration still enables limits. Both modes keep caching
-enabled.
+are decoded again when needed. A specification larger than the byte budget is
+returned to its caller but is not cached. Eviction removes the cache's reference;
+objects still needed by verification remain alive. A later request can therefore
+decode another copy of an evicted specification that is still in use elsewhere.
 
 Disabling the limits can avoid repeated decoding, but retains more decoded
 specifications until the session ends or a subsequent lookup enforces limits.
 Neither mode caps process memory: the encoded size is not the decoded heap
 size, and GHC and verification also use memory.
+
+The earlier fixed `--spec-cache-limit` preset has been removed. To reproduce
+its previous behavior, specify
+`--spec-cache-max-entries=128 --spec-cache-max-bytes=67108864`. Those values are
+an explicit choice, not defaults or built-in thresholds.
 
 ## Incremental Checking
 

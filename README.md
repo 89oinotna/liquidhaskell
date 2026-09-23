@@ -287,9 +287,10 @@ extensible interface field, keeps a versioned fingerprint and size in a small
 module annotation, and stores dependency references instead of embedding their
 specification bodies. Dependency loading merges specifications incrementally
 and shares decoded libraries through a session cache with no limits by default.
-The [`--spec-cache-limit`](docs/mkDocs/docs/options.md#specification-cache)
-option enables the cache's entry and size limits. Specification changes
-participate in recompilation checks, including with `-fno-code`.
+The [`--spec-cache-max-entries=N` and `--spec-cache-max-bytes=N`](docs/mkDocs/docs/options.md#specification-cache)
+options independently configure the cache's entry and encoded-size limits.
+Specification changes participate in recompilation checks, including with
+`-fno-code`.
 
 The storage and recompilation regression tests are registered as the
 `liquidhaskell-boot:plugin-storage` test suite:
