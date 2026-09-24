@@ -12,29 +12,79 @@ import Data.List (sortOn)
 -- zero for either limit disables retention, without preventing loading.
 data Limits = Limits !(Maybe Int) !(Maybe Int)
 
-newtype Cache k v = Cache (MVar (Integer, M.Map k (Integer, Int, v)))
+-- The cache is a mutable map from keys to entries, with an access counter for
+-- least-recently-used eviction. The cache is not persistent across GHC sessions.
+--
+-- The 'MVar' protects @(accessCounter, entries)@, including loading a missing
+-- value and inserting it, so concurrent requests can reuse the loaded value.
+--
+-- * The outer 'Integer' is a logical access counter, incremented on each
+--   successful lookup (hit or miss). 
+-- * The 'M.Map' associates each key @k@ with
+--   @(lastAccess, encodedBytes, value)@. 
+--
+-- * The key is a module identity and
+--   payload fingerprint, distinguishing specification versions.
+-- * The entry's 'Integer' records the access counter at its most recent lookup.
+-- * The entry's 'Int' is the encoded payload length in bytes, supplied when the
+--   value is loaded.
+-- * The entry's @v@ is the cached value itself (a decoded specification library
+--   in the plugin).
+newtype Cache k v = Cache (MVar (Integer , M.Map k (Integer, Int, v)))
 
 newCache :: IO (Cache k v)
 newCache = Cache <$> newMVar (0, M.empty)
 
--- | The weight is the encoded payload size, not an estimate of live heap.
--- Oversized entries are usable but are not retained by the cache.
--- Limits apply to every lookup, including hits, because modules sharing a
--- session can select different policies through their LiquidHaskell options.
-cached :: Ord k => Cache k v -> Limits -> k -> Int -> IO v -> IO v
+-- | The cached function returns a retained value for a key, 
+-- or runs the supplied loader on a miss.
+--
+-- Side Effects:
+-- * The cache lock covers lookup, loading, and updating the state. Concurrent
+--   requests reuse the loaded value while it remains retained.
+-- * Each successful call advances the access counter and marks a retained entry
+--   as most recently used. 
+-- * Least-recently-used entries are evicted until the bounds are met.
+-- * If loading or updating throws, the exception propagates and the
+--   previous cache state is restored.
+--
+-- Preconditions:
+--
+-- * Encoded sizes and any configured limits must be non-negative. This
+--   function does not validate those inputs.
+-- * A key must consistently identify the same value and encoded size. A hit
+--   uses the stored value and size, ignoring the supplied loader and size;
+--   changed specifications therefore require a different key.
+-- * The loader must not call 'cached' on this same cache, or wait for another
+--   operation that needs its lock. The lock is held while the loader runs,
+--   so such a dependency would deadlock.
+cached
+  :: Ord k
+  => Cache k v
+  -> Limits
+  -- ^ Independent entry-count and total encoded-byte bounds for this lookup.
+  -- 'Nothing' leaves a bound unlimited; zero for either disables retention.
+  -> k
+  -- ^ Identity of the requested value. 
+  -> Int
+  -- ^ Encoded payload length in bytes, recorded on a miss for byte-budget
+  -- accounting. 
+  -> IO v
+  -- ^ Action that loads the value on a miss, while holding the cache lock.
+  -> IO v
+  -- ^ The retained or newly loaded value. Loader and cache-update exceptions propagate.
 cached (Cache state) limits key weight load =
   modifyMVar state $ \(clock, entries) -> do
-    let next = clock + 1
-    next `seq` case M.lookup key entries of
+    let !next = clock + 1
+    case M.lookup key entries of
       Just (_, oldWeight, value) ->
-        let entries' = retain next oldWeight value entries
-        in entries' `seq` pure ((next, entries'), value)
+        let !entries' = retain next oldWeight value entries
+        in pure ((next, entries'), value)
       Nothing -> do
-        value <- load
-        let entries' = retain next weight value entries
+        !value <- load
+        let !entries' = retain next weight value entries
         -- Evaluate eviction before publishing the state. A deferred trim could
         -- otherwise keep evicted or oversized values alive until another hit.
-        value `seq` entries' `seq` pure ((next, entries'), value)
+        pure ((next, entries'), value)
   where
     retain next entryWeight value entries = case limits of
       Limits Nothing Nothing -> M.insert key (next, entryWeight, value) entries
