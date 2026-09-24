@@ -2,7 +2,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Large LH payloads live in an extensible interface field. Only their
--- version, size and fingerprint live in GHC's boxed-byte annotations. Keeping
+-- version and fingerprint live in GHC's boxed-byte annotations. Keeping
 -- the fingerprint in an annotation makes it participate in GHC's ordinary
 -- interface fingerprinting and recompilation checks.
 module Language.Haskell.Liquid.GHC.Plugin.Compact
@@ -30,10 +30,42 @@ import Data.Word
 import Foreign.Ptr (castPtr)
 import qualified Liquid.GHC.API as GHC
 
+
+-- | Fingerprint of the encoded specification payload. The pair holds the two
+-- 64-bit words of the 128-bit 'GHC.Fingerprint' produced by 'GHC.fingerprintData',
+-- in the same order as that constructor's fields.
+-- Stored in the interface marker and dependency references to detect payload
+-- changes or mismatches. Together with the full module identity, it forms the
+-- key used to reuse decoded specifications in the session cache.
 type PayloadId = (Word64, Word64)
 
--- A distinct annotation type prevents old plugins from decoding the new format
--- as a legacy LiquidLib. New plugins report legacy interfaces explicitly.
+-- | Small annotation containing the 'B.encode' representation of this tuple:
+--
+-- @
+-- (version, (fingerprintWord1, fingerprintWord2))
+--   :: (Word32, (Word64, Word64))
+-- @
+--
+-- * @version@ is the marker format version, currently 1.
+-- * The two fingerprint words form the 'PayloadId' computed from the complete
+--   encoded specification payload, in 'GHC.Fingerprint' constructor order.
+--
+-- 'B.encode' writes these unsigned words consecutively in big-endian order:
+--
+-- @
+-- Byte offsets   Contents
+--  0..3          Format version (Word32)
+--  4..11         First fingerprint word (Word64)
+-- 12..19         Second fingerprint word (Word64)
+-- @
+--
+-- 'markerBytes' holds these 20 raw bytes as a list for 'GHC.toSerialized',
+-- obtained by unpacking the encoded tuple. The list is not itself encoded
+-- with 'B.encode', so it contributes no list-length prefix. The 20-byte count
+-- excludes GHC's annotation wrapper and the list's in-memory overhead.
+-- The specification payload itself lives in the extensible interface field.
+-- Keeping the fingerprint in an annotation makes specification changes
+-- participate in GHC's interface fingerprinting and recompilation checks.
 newtype PayloadMarker = PayloadMarker { markerBytes :: [Word8] }
 
 newtype PendingPayload = PendingPayload BS.ByteString
@@ -47,17 +79,17 @@ payloadId bytes = BS.useAsCStringLen bytes $ \(ptr, size) -> do
   GHC.Fingerprint a b <- GHC.fingerprintData (castPtr ptr) size
   pure (a, b)
 
-payloadMarker :: PayloadId -> Int -> PayloadMarker
-payloadMarker fingerprint size =
-  PayloadMarker $ BL.unpack $ B.encode (1 :: Word32, fingerprint, fromIntegral size :: Word64)
+payloadMarker :: PayloadId -> PayloadMarker
+payloadMarker fingerprint =
+  PayloadMarker $ BL.unpack $ B.encode (1 :: Word32, fingerprint)
 
-decodeMarker :: PayloadMarker -> Either String (PayloadId, Int)
+decodeMarker :: PayloadMarker -> Either String PayloadId
 decodeMarker (PayloadMarker bytes) = case B.decodeOrFail (BL.pack bytes) of
   Left (_, _, err) -> Left $ "Malformed LiquidHaskell interface marker: " ++ err
-  Right (rest, _, (version :: Word32, fingerprint, size :: Word64))
+  Right (rest, _, (version :: Word32, fingerprint))
     | version /= 1 -> Left "Unsupported LiquidHaskell interface version; rebuild dependencies."
-    | not (BL.null rest) || size > fromIntegral (maxBound :: Int) -> Left "Malformed LiquidHaskell interface marker."
-    | otherwise -> Right (fingerprint, fromIntegral size)
+    | not (BL.null rest) -> Left "Malformed LiquidHaskell interface marker."
+    | otherwise -> Right fingerprint
 
 -- The module's existing typed TH-state map gives this payload the same lifetime
 -- as its GHC.TcGblEnv. A private TypeRep key cannot collide with user TH state, and
@@ -92,7 +124,7 @@ rebuildSimpleIface :: GHC.HscEnv -> BS.ByteString -> GHC.ModIface -> IO GHC.ModI
 rebuildSimpleIface env bytes iface = do
     fingerprint <- payloadId bytes
     let marker = GHC.IfaceAnnotation (GHC.ModuleTarget $ GHC.mi_module iface) $
-          GHC.toSerialized markerBytes (payloadMarker fingerprint $ BS.length bytes)
+          GHC.toSerialized markerBytes (payloadMarker fingerprint)
     GHC.mkFullIface env (GHC.set_mi_anns (marker : GHC.mi_anns iface) partial) Nothing Nothing GHC.NoStubs []
   where
     partial =

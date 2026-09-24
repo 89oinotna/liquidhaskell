@@ -15,7 +15,6 @@ import qualified Data.Binary                             as B
 import qualified Data.Binary.Builder                     as Builder
 import qualified Data.Binary.Put                         as B
 import qualified Data.ByteString.Lazy                    as B
-import qualified Data.ByteString                         as BS
 import           Data.Data (Data)
 import           Control.Exception
 import           Control.Exception.Backtrace
@@ -25,7 +24,6 @@ import qualified Data.HashMap.Strict                     as M
 import           Data.Maybe                               ( listToMaybe, mapMaybe )
 import           Data.IORef
 import           Data.Unique
-import           Data.Word (Word8)
 import           GHC.Stack (HasCallStack)
 import           System.IO.Unsafe (unsafePerformIO)
 import           System.Mem.Weak (Weak, deRefWeak)
@@ -35,15 +33,11 @@ import           Language.Haskell.Liquid.GHC.Plugin.Types (LiquidLib, SpecRefere
 import qualified Language.Haskell.Liquid.GHC.Plugin.Compact as Compact
 import qualified Language.Haskell.Liquid.GHC.Plugin.Cache as Cache
 import           Language.Haskell.Liquid.Types.Names
-import           Language.Haskell.Liquid.UX.Config (Config, specCacheMaxEntries, specCacheMaxBytes)
 
 
 --
 -- Serialising and deserialising Specs
 --
-
--- Retain the old annotation's type identity solely to diagnose stale interfaces.
-newtype LiquidLibBytes = LiquidLibBytes [Word8]
 
 serialiseLiquidLib :: GHC.HscEnv -> LiquidLib -> GHC.TcGblEnv -> IO GHC.Annotation
 serialiseLiquidLib env lib tcg = do
@@ -55,11 +49,11 @@ serialiseLiquidLib env lib tcg = do
         maybe (ioError $ userError "LiquidHaskell: dependency interface disappeared during verification") pure
     Compact.stageDependencies tcg ifaces
     pure $ GHC.Annotation (GHC.ModuleTarget $ GHC.tcg_mod tcg) $
-      GHC.toSerialized Compact.markerBytes (Compact.payloadMarker fingerprint $ BS.length bytes)
+      GHC.toSerialized Compact.markerBytes (Compact.payloadMarker fingerprint)
 
 -- GHC's interface cache holds encoded data; this cache holds canonical decoded
--- module specs, never merged transitive closures. Entry and encoded-size limits
--- are opt-in. The EPS weak key releases the entire cache when its
+-- module specs, never merged transitive closures. Every decoded library remains
+-- retained for reuse. The EPS weak key releases the entire cache when its
 -- compilation session dies, including sessions abandoned by IDE clients.
 type LibraryCache = Cache.Cache SpecReference LiquidLib
 data SessionCache = SessionCache !Unique !(Weak (IORef GHC.ExternalPackageState)) !LibraryCache
@@ -89,8 +83,8 @@ getLibraryCache env = modifyMVar sessionCaches $ \sessions -> do
       alive <- deRefWeak weak
       if alive == Just epsRef then pure (Just cache) else findSession rest
 
-deserialiseLiquidLib :: Config -> GHC.HscEnv -> GHC.Module -> IO (Maybe (SpecReference, LiquidLib))
-deserialiseLiquidLib cfg env thisModule = do
+deserialiseLiquidLib :: GHC.HscEnv -> GHC.Module -> IO (Maybe (SpecReference, LiquidLib))
+deserialiseLiquidLib env thisModule = do
     eps <- readIORef $ GHC.euc_eps $ GHC.ue_eps $ GHC.hsc_unit_env env
     home <- GHC.lookupHugByModule thisModule (GHC.hsc_HUG env)
     let homeAnnotations = case home of
@@ -103,21 +97,20 @@ deserialiseLiquidLib cfg env thisModule = do
     case listToMaybe $ annotations Compact.PayloadMarker of
       Nothing -> do
         iface <- GHC.lookupIfaceByModuleHsc env thisModule
-        -- A compact field without a recognized marker can come from another
-        -- plugin build whose annotation TypeRep has a different package ID.
-        if not (null $ annotations LiquidLibBytes) || maybe False Compact.hasPayload iface
-          then ioError $ userError $ "LiquidHaskell: legacy or incompatible interface for " ++
+        -- A compact payload requires its marker for identification and validation.
+        if maybe False Compact.hasPayload iface
+          then ioError $ userError $ "LiquidHaskell: missing specification marker for " ++
             GHC.renderModule thisModule ++ ". Rebuild this dependency with the current LiquidHaskell plugin."
           else pure Nothing
       Just marker -> do
-        (fingerprint, size) <- either (ioError . userError) pure $ Compact.decodeMarker marker
+        fingerprint <- either (ioError . userError) pure $ Compact.decodeMarker marker
         let reference = SpecReference (GHC.toStableModule thisModule) fingerprint
         cache <- getLibraryCache env
-        lib <- Cache.cached cache limits reference size $ do
+        lib <- Cache.cached cache reference $ do
           iface <- GHC.lookupIfaceByModuleHsc env thisModule
           bytes <- maybe (pure Nothing) Compact.readPayload iface >>= maybe missingPayload pure
           actual <- Compact.payloadId bytes
-          unless (BS.length bytes == size && actual == fingerprint) $
+          unless (actual == fingerprint) $
             ioError $ userError $ "LiquidHaskell: corrupt specification for " ++ GHC.renderModule thisModule
           -- Lazy name decoding must retain only the NameCache, not a selector
           -- thunk keeping the entire HscEnv (and our weak session key) alive.
@@ -125,7 +118,6 @@ deserialiseLiquidLib cfg env thisModule = do
           nameCache `seq` decodeLiquidLib nameCache (B.fromStrict bytes)
         pure $ Just (reference, lib)
   where
-    limits = Cache.Limits (specCacheMaxEntries cfg) (specCacheMaxBytes cfg)
     missingPayload = ioError $ userError $ "LiquidHaskell: missing compact specification for " ++
       GHC.renderModule thisModule ++ ". Rebuild this dependency with the current LiquidHaskell plugin."
 

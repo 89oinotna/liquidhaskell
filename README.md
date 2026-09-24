@@ -86,10 +86,6 @@ when running `cabal` to skip rebuilding those packages.
 DANGER: Note that this can give an invalid result if the changes to
 `liquidhaskell-boot` do require rebuilding other `liquid*` packages.
 
-Changes to the specification interface format require rebuilding those
-packages. See [upgrading the interface format](docs/mkDocs/docs/install.md#upgrading-from-the-annotation-based-interface-format)
-for the compact format's migration instructions.
-
 ## How To Run Regression Tests
 
 For documentation on the `test-driver` executable itself, please refer to the
@@ -268,8 +264,9 @@ foo = GHC.isEqPrimPred -- OK.
 
 # GHC Plugin Development Guide
 
-This code commentary describes the current architecture for the GHC [Plugin][] that enables LiquidHaskell
-to check files as part of the normal compilation process. For the sake of this commentary, we refer to
+This code commentary describes the current architecture for the GHC [Plugin][]
+that enables LiquidHaskell to check files as part of the normal compilation
+process. For the sake of this commentary, we refer to
 the code provided as part of the `release/0.8.10.2` branch, commit `9a2f8284c5fe5b18ed0410e842acd3329a629a6b`.
 
 ## GHC.Interface vs GHC.Plugin
@@ -280,24 +277,6 @@ interface LH with the old executable. Generally speaking, the [GHC.Interface][] 
 and it's rarely what one wants to modify. It will probably be removed at some point.
 
 ## Plugin architecture
-
-The historical description below uses the annotation-based interface format.
-The current plugin stores specification bodies in the `liquidhaskell.spec.v1`
-extensible interface field, keeps a versioned fingerprint and size in a small
-module annotation, and stores dependency references instead of embedding their
-specification bodies. Dependency loading merges specifications incrementally
-and shares decoded libraries through a session cache with no limits by default.
-The [`--spec-cache-max-entries=N` and `--spec-cache-max-bytes=N`](docs/mkDocs/docs/options.md#specification-cache)
-options independently configure the cache's entry and encoded-size limits.
-Specification changes participate in recompilation checks, including with
-`-fno-code`.
-
-The storage and recompilation regression tests are registered as the
-`liquidhaskell-boot:plugin-storage` test suite:
-
-```sh
-cabal test liquidhaskell-boot:plugin-storage
-```
 
 Broadly speaking, the Plugin is organised this way: In the [typechecking phase][], we typecheck and desugar
 each module via the GHC API in order to extract the unoptimised [core binds][] that are needed by
@@ -313,9 +292,20 @@ This phase is also responsible for:
 * Storing the [LiftedSpec][] into an interface annotation for later retrieval;
 * Checking and verifying the module using LH's existing API.
 
+Each checked module publishes a serialized `LiquidLib` in its GHC interface
+(`.hi`) file. It contains the module's own [LiftedSpec][] and a flat list of
+dependency references. Each reference identifies a module, including its
+package/unit, and the fingerprint of its specification payload.
+
+The payload lives in `liquidhaskell.spec.v1`, the plugin's named field in GHC's
+extensible interface storage. A small module annotation holds the format
+version and payload fingerprint. The fingerprint participates
+in GHC's recompilation checks.
+
 The reason why we do everything in the [typechecking phase][] is also to allow integrations with tools like
 [ghcide][]. There are a number of differences between the plugin and the operations performed as part of the
 [GHC.Interface][], which we are going to outline in the next section.
+
 
 ## Differences with the GHC.Interface
 
@@ -370,15 +360,17 @@ that can be tested with `./scripts/test/test_plugin.sh`.
 [GHC.Plugin]:          liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Plugin.hs
 [GHC.Interface]:       liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Interface.hs
 [SpecFinder]:          liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Plugin/SpecFinder.hs
-[LiftedSpec]:          liquidhaskell-boot/src/Language/Haskell/Liquid/Types/Specs.hs#L559
-[TargetSrc]:           liquidhaskell-boot/src/Language/Haskell/Liquid/Types/Specs.hs#L158
-[typechecking phase]:  liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Plugin.hs#L211-L226
+[Serialisation]:       liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Plugin/Serialisation.hs
+[Compact]:             liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Plugin/Compact.hs
+[LiftedSpec]:          liquidhaskell-boot/src/Language/Haskell/Liquid/Types/Specs.hs#L737
+[TargetSrc]:           liquidhaskell-boot/src/Language/Haskell/Liquid/Types/Specs.hs#L176
+[typechecking phase]:  liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Plugin.hs#L304
 [ghcide]:              https://github.com/haskell/ghcide
-[findRelevantSpecs]:   liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Plugin/SpecFinder.hs#L65
 [core binds]:          https://hackage.haskell.org/package/ghc-9.6.3/docs/GHC-Core.html#t:CoreBind
+[findRelevantSpecs]:   liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Plugin/SpecFinder.hs#L54
 [configureGhcTargets]: liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Interface.hs#L254
 [processTargetModule]: liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Interface.hs#L483
-[processModule]:       liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Plugin.hs#L509
+[processModule]:       liquidhaskell-boot/src/Language/Haskell/Liquid/GHC/Plugin.hs#L535
 
 # Module Verification Process
 

@@ -51,7 +51,7 @@ data LoadedSpec = LoadedSpec !Bool !SpecReference !LiftedSpec
 --
 -- Assumptions are taken from _LHAssumptions modules only if the interface
 -- file of the matching module contains no spec.
-findRelevantSpecs :: Config -- ^ Assumption exclusions and cache policy for this module
+findRelevantSpecs :: Config -- ^ Assumption exclusions for this module
                   -> HscEnv
                   -> [Module]
                   -- ^ Any relevant module fetched during dependency-discovery.
@@ -91,7 +91,7 @@ findRelevantSpecs cfg hscEnv mods = do
         -- References include package/unit identity and the exact saved spec
         -- fingerprint. Never resolve them by an unqualified module name.
         _ <- initIfaceTcRn $ loadInterface "liquidhaskell dependency" mdl ImportBySystem
-        found <- liftIO $ Serialisation.deserialiseLiquidLib cfg hscEnv mdl
+        found <- liftIO $ Serialisation.deserialiseLiquidLib hscEnv mdl
         case found of
           Just (actual, lib) -> do
             checkReference ref actual
@@ -107,7 +107,7 @@ findRelevantSpecs cfg hscEnv mods = do
 
     loadRelevantSpec :: Module -> TcM (Maybe (SpecReference, LiquidLib))
     loadRelevantSpec currentModule = do
-      res <- liftIO $ Serialisation.deserialiseLiquidLib cfg hscEnv currentModule
+      res <- liftIO $ Serialisation.deserialiseLiquidLib hscEnv currentModule
       case res of
         Nothing -> loadModuleLHAssumptionsIfAny currentModule
         Just _ -> pure res
@@ -129,7 +129,7 @@ findRelevantSpecs cfg hscEnv mods = do
       case res of
         Found _ assumptionsMod -> do
           _ <- initIfaceTcRn $ loadInterface "liquidhaskell assumptions" assumptionsMod ImportBySystem
-          liftIO $ Serialisation.deserialiseLiquidLib cfg hscEnv assumptionsMod
+          liftIO $ Serialisation.deserialiseLiquidLib hscEnv assumptionsMod
         FoundMultiple{} -> failWithTc $ mkTcRnUnknownMessage $ mkPlainError [] $
                              missingInterfaceErrorDiagnostic (initIfaceMessageOpts $ hsc_dflags hscEnv) $
                              cannotFindModule hscEnv assumptionsModName res

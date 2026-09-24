@@ -142,8 +142,6 @@ defConfig = Config
   , noSimplifyCore                = False
   , noslice                       = False
   , noLiftedImport                = False
-  , specCacheMaxEntries           = Nothing
-  , specCacheMaxBytes             = Nothing
   , proofLogicEval                = False
   , pleWithUndecidedGuards        = False
   , interpreter                   = False
@@ -289,13 +287,6 @@ lhOptions =
       "Disable non-concrete KVar slicing"
   , opt [] ["no-lifted-imports"] (NoArg $ fm $ \c -> c { noLiftedImport = True })
       "Disable loading lifted specifications (for legacy libs)"
-  , opt [] ["spec-cache-max-entries"] (ReqArg (fm . setSpecCacheMaxEntries) "N")
-      "Maximum cached specifications (default: unlimited; 0: retain none)"
-  , opt [] ["spec-cache-max-bytes"] (ReqArg (fm . setSpecCacheMaxBytes) "N")
-      "Maximum combined encoded bytes in the specification cache (default: unlimited; 0: retain none)"
-  , opt [] ["no-spec-cache-limit"] (NoArg $ fm $ \c -> c
-      { specCacheMaxEntries = Nothing, specCacheMaxBytes = Nothing })
-      "Clear both specification cache limits (unlimited is the default)"
   , opt [] ["json"] (NoArg $ fm $ \c -> c { json = True })
       "Print results in JSON (for editor integration)"
   , opt [] ["counter-examples"] (NoArg $ fm $ \c -> c { counterExamples = True })
@@ -431,24 +422,6 @@ setEliminate s c = c { eliminate = parseEliminate s }
 
 setFuel :: String -> Config -> Config
 setFuel s c = c { fuel = Just (readInt "fuel" s) }
-
-setSpecCacheMaxEntries :: String -> Config -> Config
-setSpecCacheMaxEntries s c =
-  let n = readCacheLimit "spec-cache-max-entries" s
-  in n `seq` c { specCacheMaxEntries = Just n }
-
-setSpecCacheMaxBytes :: String -> Config -> Config
-setSpecCacheMaxBytes s c =
-  let n = readCacheLimit "spec-cache-max-bytes" s
-  in n `seq` c { specCacheMaxBytes = Just n }
-
--- Parse as Integer first: reading directly as Int can silently wrap values
--- outside its range. Force validation even if a later option resets the limit.
-readCacheLimit :: String -> String -> Int
-readCacheLimit opt s = case reads s of
-  [(n, "")] | n >= 0 && n <= toInteger (maxBound :: Int) -> fromInteger n
-  _ -> error $ "Expected integer between 0 and " ++ show (maxBound :: Int)
-            ++ " for --" ++ opt ++ ", got: " ++ show s
 
 addExcludeAssumptions :: String -> Config -> Config
 addExcludeAssumptions s c =
