@@ -21,6 +21,7 @@ requiring users to mind how they specify dependencies.
 
 module Language.Haskell.Liquid.GHC.Plugin.SpecFinder
     ( findRelevantSpecs
+    , LoadedSpec(..)
     , configToRedundantDependencies
     ) where
 
@@ -36,11 +37,20 @@ import qualified Data.Char
 import           Data.Maybe
 import           Control.Monad (foldM, unless)
 import qualified Data.HashMap.Strict as HM
-import           Data.List (sortOn)
 
--- Force the target when inserting it, as the old strict map did. Otherwise a
--- selector thunk can retain the entire decoded library and its reference list.
-data LoadedSpec = LoadedSpec !Bool !SpecReference !LiftedSpec
+-- | One selected specification in the dependency accumulator, indexed by the
+-- module identity in its reference. Forcing the specification field prevents
+-- a 'libTarget' selector thunk from retaining the whole decoded library and
+-- its reference list.
+data LoadedSpec = LoadedSpec
+    !Bool
+    -- ^ 'True' when selected as the target of an input module lookup, including
+    -- an _LHAssumptions fallback. Such a selection takes precedence over one
+    -- reached only through a saved dependency reference ('False').
+    !SpecReference
+    -- ^ Full module identity and payload fingerprint of the selected library.
+    !LiftedSpec
+    -- ^ That library's own exported specification, used for verification.
 
 -- | Load any relevant spec for the input list of 'Module's, by querying both the 'ExternalPackageState'
 -- and the 'HomePackageTable'.
@@ -51,20 +61,33 @@ data LoadedSpec = LoadedSpec !Bool !SpecReference !LiftedSpec
 --
 -- Assumptions are taken from _LHAssumptions modules only if the interface
 -- file of the matching module contains no spec.
+--
+-- The result maps full module identities to their selected 'LoadedSpec',
+-- including specifications reached through saved dependency references. Each
+-- entry keeps the specification and its reference together, so the caller can
+-- filter configuration-dependent exclusions once before extracting the
+-- verification specifications and the references to export.
 findRelevantSpecs :: Config -- ^ Assumption exclusions for this module
                   -> HscEnv
                   -> [Module]
                   -- ^ Any relevant module fetched during dependency-discovery.
-                  -> TcM (TargetDependencies, [SpecReference])
-findRelevantSpecs cfg hscEnv mods = do
-    entries <- foldM loadAndMerge HM.empty mods
-    pure ( TargetDependencies $ HM.map (\(LoadedSpec _ _ spec) -> spec) entries
-         , sortOn specModule [ref | LoadedSpec _ ref _ <- HM.elems entries]
-         )
+                  -> TcM (HM.HashMap StableModule LoadedSpec)
+findRelevantSpecs cfg hscEnv mods = foldM loadAndMerge HM.empty mods
   where
-    -- Preserve discovery order (loading assumptions mutates GHC's EPS), and
-    -- reproduce the old reverse/fold precedence without retaining all results:
-    -- the first direct target wins; otherwise the last dependency entry wins.
+    -- Load an input module's library (or its matching assumptions), resolve its
+    -- saved dependency references with mergeDependency, then select its own
+    -- libTarget in the accumulator. If no library is found, leave it unchanged.
+    -- "Merge" means selecting one whole LiftedSpec per module key; it does not
+    -- combine fields from different specifications.
+    --
+    -- The first directly selected target for a key wins. A direct selection
+    -- replaces a dependency-only selection, reusing its spec when references
+    -- match. Process inputs in order because loading assumptions updates GHC's
+    -- external package state. Force each updated map before the next input.
+    loadAndMerge
+      :: HM.HashMap StableModule LoadedSpec
+      -> Module
+      -> TcM (HM.HashMap StableModule LoadedSpec)
     loadAndMerge entries currentModule = do
       found <- loadRelevantSpec currentModule
       case found of
@@ -81,6 +104,21 @@ findRelevantSpecs cfg hscEnv mods = do
           -- loading the next interface, including imports with no dependencies.
           merged `seq` pure merged
 
+    -- Resolve one saved dependency reference into the accumulator. An existing
+    -- direct selection is retained only if its reference matches; a mismatch
+    -- is an error. A matching dependency-only selection is also reused.
+    -- Otherwise load the referenced interface, check the library's fingerprint,
+    -- and insert its libTarget, replacing any dependency-only selection for
+    -- that module. Missing or stale specifications fail verification; loader
+    -- exceptions propagate.
+    --
+    -- This selects a whole specification, not a field-by-field combination.
+    -- The referenced library's dependencies are not traversed here: the
+    -- importing library already stores its selected references as a flat list.
+    mergeDependency
+      :: HM.HashMap StableModule LoadedSpec
+      -> SpecReference
+      -> TcM (HM.HashMap StableModule LoadedSpec)
     mergeDependency entries ref = case HM.lookup (specModule ref) entries of
       Just (LoadedSpec True actual _) -> do
         checkReference ref actual

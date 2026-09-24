@@ -11,8 +11,7 @@ module Language.Haskell.Liquid.GHC.Plugin.Compact
   , payloadId
   , payloadMarker
   , decodeMarker
-  , stagePayload
-  , stageDependencies
+  , stageSpec
   , installInterfaceHook
   , readPayload
   , hasPayload
@@ -39,7 +38,7 @@ import qualified Liquid.GHC.API as GHC
 -- key used to reuse decoded specifications in the session cache.
 type PayloadId = (Word64, Word64)
 
--- | Small annotation containing the 'B.encode' representation of this tuple:
+-- | Annotation containing the 'B.encode' representation of this tuple:
 --
 -- @
 -- (version, (fingerprintWord1, fingerprintWord2))
@@ -60,16 +59,15 @@ type PayloadId = (Word64, Word64)
 -- @
 --
 -- 'markerBytes' holds these 20 raw bytes as a list for 'GHC.toSerialized',
--- obtained by unpacking the encoded tuple. The list is not itself encoded
--- with 'B.encode', so it contributes no list-length prefix. The 20-byte count
--- excludes GHC's annotation wrapper and the list's in-memory overhead.
+-- obtained by unpacking the encoded tuple.
 -- The specification payload itself lives in the extensible interface field.
 -- Keeping the fingerprint in an annotation makes specification changes
 -- participate in GHC's interface fingerprinting and recompilation checks.
 newtype PayloadMarker = PayloadMarker { markerBytes :: [Word8] }
 
-newtype PendingPayload = PendingPayload BS.ByteString
-newtype PendingUsages = PendingUsages [GHC.Usage]
+-- | One prepared specification waiting for interface publication: its encoded
+-- bytes, their fingerprint, and the usages of the dependencies it consumed.
+data PendingSpec = PendingSpec !BS.ByteString !PayloadId ![GHC.Usage]
 
 fieldName :: GHC.FieldName
 fieldName = "liquidhaskell.spec.v1"
@@ -91,22 +89,23 @@ decodeMarker (PayloadMarker bytes) = case B.decodeOrFail (BL.pack bytes) of
     | not (BL.null rest) -> Left "Malformed LiquidHaskell interface marker."
     | otherwise -> Right fingerprint
 
--- The module's existing typed TH-state map gives this payload the same lifetime
--- as its GHC.TcGblEnv. A private TypeRep key cannot collide with user TH state, and
--- avoids a global pending-payload table retaining abandoned/failed compilations.
-stagePayload :: GHC.TcGblEnv -> BS.ByteString -> IO ()
-stagePayload tcg bytes = atomicModifyIORef' (GHC.tcg_th_state tcg) $ \state ->
-  (M.insert (typeOf (PendingPayload bytes)) (toDyn $ PendingPayload bytes) state, ())
-
+-- | Prepare the payload and its dependency usages in one update to the module's
+-- typed TH-state map, returning the marker to attach as an annotation. The
+-- fingerprint is computed once and retained for simple-interface rebuilding.
+-- A private TypeRep key isolates this state and ties its lifetime to TcGblEnv.
+--
 -- GHC's entity-level home-module usages can overlook changes to module
 -- annotations. LH consumes the whole specification, so record whole-module ABI
 -- usages for home modules as well as package modules. GHC's checker resolves
 -- these by full module identity in either interface table.
-stageDependencies :: GHC.TcGblEnv -> [GHC.ModIface] -> IO ()
-stageDependencies tcg ifaces = do
+stageSpec :: GHC.TcGblEnv -> BS.ByteString -> [GHC.ModIface] -> IO PayloadMarker
+stageSpec tcg bytes ifaces = do
+  fingerprint <- payloadId bytes
   usages <- mapM usage ifaces
+  let pending = PendingSpec bytes fingerprint usages
   atomicModifyIORef' (GHC.tcg_th_state tcg) $ \state ->
-    (M.insert (typeOf (PendingUsages usages)) (toDyn $ PendingUsages usages) state, ())
+    (M.insert (typeOf pending) (toDyn pending) state, ())
+  pure $ payloadMarker fingerprint
   where
     usage iface =
       let mdl = GHC.mi_module iface
@@ -117,12 +116,28 @@ addUsages :: [GHC.Usage] -> GHC.ModIface_ phase -> GHC.ModIface_ phase
 addUsages usages iface = GHC.set_mi_self_recomp
   ((\info -> info { GHC.mi_sr_usages = usages ++ GHC.mi_sr_usages info }) <$> GHC.mi_self_recomp_info iface) iface
 
--- Simple interfaces omit annotations in GHC 9.14. Restore our marker and run
--- normal fingerprinting so specification changes affect the module ABI in
--- -fno-code mode too. The original declaration bodies and metadata are reused.
-rebuildSimpleIface :: GHC.HscEnv -> BS.ByteString -> GHC.ModIface -> IO GHC.ModIface
-rebuildSimpleIface env bytes iface = do
-    fingerprint <- payloadId bytes
+-- | Restore the marker in a simple interface and recompute its fingerprints.
+--
+-- serialiseSpec already supplies the marker in tcg_anns before T_HscPostTc.
+-- GHC 9.14's simple-interface path goes through hscSimpleIface and mkIfaceTc,
+-- using ModDetails from mkBootModDetailsTc. This path omits the annotations;
+-- supplying the marker earlier in tcg_anns is therefore insufficient.
+--
+-- When the delegated PostTc phase returns HscUpdate, mkIfaceTc has already
+-- called mkFullIface, and GHC may already have written the interface. Adding
+-- the marker to that finished value alone would leave its fingerprints stale.
+-- mkFullIface calls addFingerprints, whose module ABI hash includes module
+-- annotations. Reconstruct the partial representation with the marker so that
+-- normal fingerprinting includes specification changes under -fno-code too.
+-- The declaration bodies are reused; this does not typecheck or verify again.
+--
+-- This workaround is specific to the completed HscUpdate interface returned
+-- by the hook we delegate to. The HscRecomp branch still has a partial
+-- interface, so its additions precede GHC's normal final fingerprinting and
+-- need no rebuild. Avoiding the simple-interface rebuild would require
+-- preserving the marker inside that construction path before mkFullIface.
+rebuildSimpleIface :: GHC.HscEnv -> PayloadId -> GHC.ModIface -> IO GHC.ModIface
+rebuildSimpleIface env fingerprint iface = do
     let marker = GHC.IfaceAnnotation (GHC.ModuleTarget $ GHC.mi_module iface) $
           GHC.toSerialized markerBytes (payloadMarker fingerprint)
     GHC.mkFullIface env (GHC.set_mi_anns (marker : GHC.mi_anns iface) partial) Nothing Nothing GHC.NoStubs []
@@ -172,19 +187,16 @@ installInterfaceHook env = env { GHC.hsc_hooks = hooks { GHC.runPhaseHook = Just
     run :: GHC.TPhase a -> IO a
     run phase@(GHC.T_HscPostTc hscEnv summary (GHC.FrontendTypecheck tcg) _ _) = do
       state <- readIORef (GHC.tcg_th_state tcg)
-      let pending = M.lookup (typeRep (Proxy :: Proxy PendingPayload)) state >>= fromDynamic
-          usages = case M.lookup (typeRep (Proxy :: Proxy PendingUsages)) state >>= fromDynamic of
-            Just (PendingUsages xs) -> xs
-            Nothing -> []
+      let pending = M.lookup (typeRep (Proxy :: Proxy PendingSpec)) state >>= fromDynamic
       result <- previous phase
       case pending of
         Nothing -> pure result
-        Just (PendingPayload bytes) -> case result of
+        Just (PendingSpec bytes fingerprint usages) -> case result of
           recomp@GHC.HscRecomp { GHC.hscs_partial_iface = iface } -> do
             iface' <- writePayload bytes $ addUsages usages iface
             pure recomp { GHC.hscs_partial_iface = iface' }
           GHC.HscUpdate iface -> do
-            rebuilt <- rebuildSimpleIface hscEnv bytes $ addUsages usages iface
+            rebuilt <- rebuildSimpleIface hscEnv fingerprint $ addUsages usages iface
             iface' <- writePayload bytes rebuilt
             -- GHC writes simple (-fno-code/boot) interfaces inside PostTc.
             -- Rewrite with the field attached, respecting GHC's write flags

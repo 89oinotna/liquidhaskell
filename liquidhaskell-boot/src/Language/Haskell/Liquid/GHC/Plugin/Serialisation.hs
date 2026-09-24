@@ -42,14 +42,12 @@ import           Language.Haskell.Liquid.Types.Names
 serialiseLiquidLib :: GHC.HscEnv -> LiquidLib -> GHC.TcGblEnv -> IO GHC.Annotation
 serialiseLiquidLib env lib tcg = do
     bytes <- B.toStrict <$> encodeLiquidLib lib
-    fingerprint <- Compact.payloadId bytes
-    Compact.stagePayload tcg bytes
     ifaces <- forM (libDeps lib) $ \ref ->
       GHC.lookupIfaceByModuleHsc env (GHC.unStableModule $ specModule ref) >>=
         maybe (ioError $ userError "LiquidHaskell: dependency interface disappeared during verification") pure
-    Compact.stageDependencies tcg ifaces
+    marker <- Compact.stageSpec tcg bytes ifaces
     pure $ GHC.Annotation (GHC.ModuleTarget $ GHC.tcg_mod tcg) $
-      GHC.toSerialized Compact.markerBytes (Compact.payloadMarker fingerprint)
+      GHC.toSerialized Compact.markerBytes marker
 
 -- GHC's interface cache holds encoded data; this cache holds canonical decoded
 -- module specs, never merged transitive closures. Every decoded library remains
@@ -83,7 +81,33 @@ getLibraryCache env = modifyMVar sessionCaches $ \sessions -> do
       alive <- deRefWeak weak
       if alive == Just epsRef then pure (Just cache) else findSession rest
 
-deserialiseLiquidLib :: GHC.HscEnv -> GHC.Module -> IO (Maybe (SpecReference, LiquidLib))
+-- | Retrieve a module's specification from the interfaces already available
+-- in the GHC session. The caller is responsible for loading the interface;
+-- this function does not discover imports or search for assumption modules.
+--
+-- Returns 'Nothing' when no specification marker is found and no compact
+-- payload field is present in the available interface. This also includes
+-- an unavailable interface with no marker. Otherwise returns 'Just' the
+-- module-and-fingerprint reference and its decoded library. A matching
+-- session-cache entry is reused; on a miss the payload is read, checked
+-- against the marker's fingerprint, decoded, and retained.
+--
+-- Raises an 'IOError' for a malformed or unsupported marker, or a compact
+-- payload without a marker. On a cache miss it also raises an 'IOError' if
+-- the interface or payload is missing, or the payload fingerprint disagrees
+-- with the marker. GHC and binary-decoding exceptions propagate rather than
+-- being converted to 'Nothing'. The returned library is not fully evaluated,
+-- so errors in lazy name resolution may arise when its contents are used.
+--
+-- May populate the session's decoded-library cache and GHC name cache.
+deserialiseLiquidLib
+  :: GHC.HscEnv
+  -- ^ Supplies home-module interfaces and external-package annotations and
+  -- interfaces, the EPS 'IORef' identifying the session's decoded-library
+  -- cache, and the 'GHC.NameCache' used to resolve serialized GHC names.
+  -> GHC.Module
+  -- ^ Full module identity, including the package/unit, whose spec is requested.
+  -> IO (Maybe (SpecReference, LiquidLib))
 deserialiseLiquidLib env thisModule = do
     eps <- readIORef $ GHC.euc_eps $ GHC.ue_eps $ GHC.hsc_unit_env env
     home <- GHC.lookupHugByModule thisModule (GHC.hsc_HUG env)

@@ -495,18 +495,17 @@ isIgnore sp = any ((== "--skip-module") . F.val) (pragmas sp)
 -- | Working with bare & lifted specs ------------------------------------------
 --------------------------------------------------------------------------------
 
--- | Loads the specs of direct dependencies and /their/ dependencies as well.
-loadDependencies :: Config -> [Module] -> TcM (TargetDependencies, [SpecReference])
+-- | Load direct and transitive specifications, keeping each reference with its
+-- specification while removing configuration-dependent exclusions.
+loadDependencies :: Config -> [Module] -> TcM (HM.HashMap StableModule LoadedSpec)
 loadDependencies currentModuleConfig mods = do
   hscEnv    <- env_top <$> getEnv
-  (deps, refs) <- SpecFinder.findRelevantSpecs currentModuleConfig hscEnv mods
+  deps <- SpecFinder.findRelevantSpecs currentModuleConfig hscEnv mods
   redundant <- liftIO $ configToRedundantDependencies hscEnv currentModuleConfig
 
   debugLog $ "Redundant dependencies ==> " ++ show redundant
 
-  pure ( foldl' (flip dropDependency) deps redundant
-       , filter ((`notElem` redundant) . specModule) refs
-       )
+  pure $ foldl' (flip HM.delete) deps redundant
 
 data LiquidHaskellContext = LiquidHaskellContext {
     lhGlobalCfg        :: Config
@@ -542,7 +541,8 @@ processModule LiquidHaskellContext{..} = do
   let bareSpec0       = lhInputSpec
 
   withPragmas lhGlobalCfg (Ms.pragmas bareSpec0) $ \moduleCfg -> do
-    (dependencies, dependencyRefs) <- loadDependencies moduleCfg lhRelevantModules
+    selectedDeps <- loadDependencies moduleCfg lhRelevantModules
+    let dependencies = TargetDependencies $ HM.map (\(LoadedSpec _ _ spec) -> spec) selectedDeps
 
     debugLog $ "Found " <> show (HM.size $ getDependencies dependencies) <> " dependencies:"
     when debugLogs $
@@ -614,7 +614,8 @@ processModule LiquidHaskellContext{..} = do
         debugLog $ "bareSpec ==> "   ++ show bareSpec
         debugLog $ "liftedSpec ==> " ++ show liftedSpec
 
-        let clientLib  = mkLiquidLib liftedSpec & addLibDependencies dependencyRefs
+        let dependencyRefs = L.sortOn specModule [ref | LoadedSpec _ ref _ <- HM.elems selectedDeps]
+            clientLib = mkLiquidLib liftedSpec & addLibDependencies dependencyRefs
 
         let result' = ProcessModuleResult {
             pmrClientLib  = clientLib
