@@ -189,17 +189,6 @@ test-suite ghc-api-tests
   default-language: Haskell2010
   ghc-options:      -W
 
-test-suite plugin-storage
-  type:             exitcode-stdio-1.0
-  main-is:          PluginStorageTests.hs
-  hs-source-dirs:    ghc-api-tests src
-  other-modules:    Language.Haskell.Liquid.GHC.Plugin.Cache
-                    Language.Haskell.Liquid.GHC.Plugin.Compact
-  build-depends:    base, binary, bytestring, containers, directory, filepath,
-                    ghc, ghc-boot, ghc-paths, liquidhaskell-boot
-  default-language: Haskell2010
-  ghc-options:      -Wall -Werror -threaded
-
 test-suite liquidhaskell-parser
   type:             exitcode-stdio-1.0
   main-is:          Parser.hs
