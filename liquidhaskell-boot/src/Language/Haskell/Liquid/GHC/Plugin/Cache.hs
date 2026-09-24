@@ -1,3 +1,5 @@
+{-# LANGUAGE BangPatterns #-}
+
 -- | A cache with optional limits. The lock covers a cache miss and insertion, so
 -- concurrent readers reuse an entry while it remains retained. Loading an
 -- entry must not recursively access this cache.
