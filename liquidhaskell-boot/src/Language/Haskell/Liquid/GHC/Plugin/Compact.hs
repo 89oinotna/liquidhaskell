@@ -83,7 +83,7 @@ stageDependencies tcg ifaces = do
 
 addUsages :: [GHC.Usage] -> GHC.ModIface_ phase -> GHC.ModIface_ phase
 addUsages usages iface = GHC.set_mi_self_recomp
-  (fmap (\info -> info { GHC.mi_sr_usages = usages ++ GHC.mi_sr_usages info }) $ GHC.mi_self_recomp_info iface) iface
+  ((\info -> info { GHC.mi_sr_usages = usages ++ GHC.mi_sr_usages info }) <$> GHC.mi_self_recomp_info iface) iface
 
 -- Simple interfaces omit annotations in GHC 9.14. Restore our marker and run
 -- normal fingerprinting so specification changes affect the module ABI in
